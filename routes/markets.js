@@ -230,11 +230,19 @@ router.delete('/sessions/:id', authenticate, async (req, res) => {
 
 router.post('/analyze', authenticate, async (req, res) => {
   try {
-    let { symbol, question, marketData, news, sessionId } = req.body;
+    let { symbol, question, marketData, news, sessionId, stream } = req.body;
+    const isStream = stream === true;
     
     if (!question) return res.status(400).json({ error: 'Question is required' });
 
-    console.log('[Markets/Analyze] User:', req.user.id, '| Q:', question, '| Session:', sessionId || 'new');
+    if (isStream) {
+      res.setHeader('Content-Type', 'text/event-stream');
+      res.setHeader('Cache-Control', 'no-cache');
+      res.setHeader('Connection', 'keep-alive');
+      res.flushHeaders?.();
+    }
+
+    console.log('[Markets/Analyze] User:', req.user.id, '| Q:', question, '| Stream:', isStream);
 
     // ── 1. Auto-detect symbol ────────────────────────────────────────────────
     const nameTickers = {
@@ -302,10 +310,13 @@ router.post('/analyze', authenticate, async (req, res) => {
           }
         }
         
+        const marketKeywords = ['market', 'stock', 'crypto', 'price', 'buy', 'sell', 'predict', 'chart', 'trend', 'economy', 'fed', 'rate', 'nifty', 'sensex', 'bull', 'bear', 'index', 'currency'];
+        const isMarketQuery = symbol || marketKeywords.some(kw => question.toLowerCase().includes(kw));
+
         const searchTarget = symbol ? symbol + " stock" : question.substring(0, 100);
         const [q, n, h] = await Promise.allSettled([
           qPromise, 
-          fetchNews(searchTarget),
+          isMarketQuery ? fetchNews(searchTarget) : Promise.resolve([]),
           symbol ? MarketData.find({ symbol }).sort({ timestamp: -1 }).limit(100).lean() : Promise.resolve([])
         ]);
         
@@ -403,46 +414,35 @@ Sector: ${f.sector||'N/A'} | P/E: ${f.pe||'N/A'} | EPS: ${cur}${f.eps||'N/A'} | 
     const systemPrompt = `You are PhonixAI, an expert financial analyst and market strategist. 
 
 CRITICAL INFORMATION:
-- The current date and time is: ${currentDate} (IST - Indian Standard Time).
+- The current date and time is: ${currentDate} (IST - Indian Standard Time). (INTERNAL REFERENCE ONLY).
+- DO NOT state the current date/time or print a "Report Date" header in your response. The date is strictly for your internal contextual awareness.
 - NEVER say you don't know the current date. You are operating in real-time.
 - If the current time is outside Indian Market Hours (Mon-Fri, 9:15 AM to 3:30 PM IST), the "Current Close" is the PREVIOUS SESSION'S CLOSING PRICE. Do NOT hallucinate that a move is happening "today intraday" if it's the weekend or 1:00 AM on a Monday. 
 - You analyze US Stocks, Indian Stocks (NSE/BSE), Crypto markets, and Forex pairs comprehensively.
 
-Your job is to give crisp, human-readable trading analysis. Use plain English — no LaTeX, no raw math formulas.
+Your job is to provide crisp, conversational, and highly insightful financial analysis. You are speaking directly to a client as an elite Wall Street strategist. 
 
-For every stock/crypto/forex question, structure your response exactly like this:
+IF THE USER IS JUST SAYING HELLO, ASKING ABOUT A GENERAL TOPIC, OR REQUESTING CODE (e.g. Python):
+- Be extremely helpful, write the code, or provide the general knowledge they requested!
+- Act as a brilliant, multifaceted AI assistant. 
+- DO NOT forcefully pivot back to the stock market or generate price targets. Just answer their question normally.
 
-## Signal & Confidence
-Start with one of: 🟢 STRONG BUY / 🟡 BUY / ⚪ HOLD / 🔴 SELL / ⛔ STRONG SELL — then state your confidence (e.g. 82% confident).
+IF THE USER IS ASKING ABOUT A STOCK, CRYPTO, OR THE MARKET:
+Write fluidly and naturally. DO NOT use rigid, robotic section headers like "## News & Sentiment" or "## Trader's Thesis". Instead, weave the data together into a compelling, human-like report.
 
-## Price Targets — 30-Day Outlook
-Use a simple Markdown table:
-| Scenario | Target | Move |
-|----------|--------|------|
-| 🎯 Bull | $XXX | +X% |
-| 📍 Base | $XXX | +X% |
-| ⚠️ Stop-Loss | $XXX | -X% |
-Then state the risk-reward ratio in plain English (e.g. "Risk-reward is 2:1 — you risk $15 to make $30"). (Adjust currency to ₹ INR for Indian stocks, or standard base currencies for Forex).
-
-## Key Levels
-Provide the exact Support and Resistance levels as bullet points (NOT a table), including the reason:
-- **Support:** ${isIndianAsset ? '₹' : '$'}XXX (Reason: ...)
-- **Resistance:** ${isIndianAsset ? '₹' : '$'}YYY (Reason: ...)
-
-## News & Sentiment
-Briefly summarize current market sentiment: Bullish / Neutral / Bearish and why in 1-2 sentences.
-
-## Trader's Thesis
-One clear paragraph: why this trade makes sense right now, what catalysts to watch, and what would invalidate this call. Provide real predictions and detailed technical/fundamental reasons.
+You must naturally incorporate:
+- A clear directional signal (e.g., 🟢 STRONG BUY, 🟡 BUY, ⚪ HOLD, 🔴 SELL, ⛔ STRONG SELL) early in your response.
+- Concrete Price Targets (Bull/Base/Bear scenarios).
+- Key Support and Resistance levels.
+- A brilliant, synthesizing thesis explaining exactly why the trade makes sense and what catalysts to watch.
 
 RULES:
-- Be direct and decisive. Never hedge excessively.
-- CRITICAL: DO NOT HALLUCINATE NUMBERS. If macro data (like FII/DII flows, specific auto sales, exact percentages) is NOT explicitly mentioned in the Live News context, DO NOT invent it. Instead, rely on broader logical inferences.
+- Be highly conversational, authoritative, and engaging. Write like a human expert.
+- CRITICAL: DO NOT HALLUCINATE NUMBERS. If macro data or specific percentages are NOT mentioned in the Live News or metrics context, do not invent them.
 - DO NOT add inline source citations. The backend will automatically append a list of sources to the bottom of your response.
-- Follow the EXACT Verified Technical Metrics provided to you when referencing past highs/lows. Do not guess the history.
-- Use the live market data provided if available. If none is provided, still give concrete price targets and a signal based on historical ranges and your internal data models up to ${currentDate}.
-- If user is asking a follow-up question, use the conversation history for context.
-- Keep your response scannable — use headers and bullets. ONLY use a table for the 30-Day Outlook.
+- Follow the EXACT Verified Technical Metrics provided to you when referencing past highs/lows. 
+- Use the live market data provided if available. If none is provided, still give concrete price targets based on your internal data models up to ${currentDate}.
+- Keep your response scannable but fluid — use bolded text and natural bullet points. Avoid markdown tables unless absolutely necessary.
 - Never output LaTeX or raw math. Write numbers in plain English.`;
 
     // ── 7. Call AI ────────────────────────────────────────────────────────────
@@ -465,20 +465,79 @@ RULES:
         messages: aiMessages,
         temperature: 0.65,
         max_tokens: 1500,
+        stream: isStream,
       }),
     });
 
     if (!llmResponse.ok) {
       const errText = await llmResponse.text();
       console.error('[Markets/Analyze] LLM error:', llmResponse.status, errText);
+      if (isStream) {
+        res.write(`data: ${JSON.stringify({ error: 'AI service error' })}\n\n`);
+        return res.end();
+      }
       throw new Error(`AI service error: ${llmResponse.status}`);
     }
 
+    if (isStream) {
+      let fullAnalysis = '';
+      if (llmResponse.body && typeof llmResponse.body.getReader !== 'undefined') {
+        const streamReader = llmResponse.body.getReader();
+        const decoder = new TextDecoder("utf-8");
+        let done = false;
+
+        while (!done) {
+          const { value, done: readerDone } = await streamReader.read();
+          done = readerDone;
+          if (value) {
+            const chunk = decoder.decode(value, { stream: true });
+            const lines = chunk.split('\n').filter(line => line.trim() !== '');
+            for (const line of lines) {
+              if (line.startsWith('data: ')) {
+                const dataStr = line.slice(6);
+                if (dataStr === '[DONE]') continue;
+                try {
+                  const data = JSON.parse(dataStr);
+                  if (data.choices?.[0]?.delta?.content) {
+                    const text = data.choices[0].delta.content;
+                    fullAnalysis += text;
+                    res.write(`data: ${JSON.stringify({ content: text })}\n\n`);
+                  }
+                } catch (e) {}
+              }
+            }
+          }
+        }
+      }
+
+      // Natively Append Sources to Bottom
+      let sourcesHtml = '';
+      if (news && news.length > 0 && symbol) {
+        sourcesHtml = '\n\n';
+        news.slice(0, 5).forEach((n) => {
+          let domain = 'News';
+          try { if (n.url) domain = new URL(n.url).hostname.replace('www.', ''); } catch(e){}
+          if (n.url) sourcesHtml += `[${domain}](${n.url}) `;
+        });
+        fullAnalysis += sourcesHtml;
+        res.write(`data: ${JSON.stringify({ content: sourcesHtml })}\n\n`);
+      }
+
+      session.messages.push({ role: 'user', content: question, symbol: symbol || null });
+      session.messages.push({ role: 'assistant', content: fullAnalysis, symbol: symbol || null, marketData: marketData || null });
+      if (session.messages.length > 100) session.messages = session.messages.slice(-100);
+      await session.save();
+
+      res.write(`data: ${JSON.stringify({ isDone: true, sessionId: session._id, symbol: symbol || null, marketData: marketData || null })}\n\n`);
+      res.end();
+      return;
+    }
+
+    // -- Normal JSON Blocking Fallback --
     const llmData = await llmResponse.json();
     let analysis = llmData.choices?.[0]?.message?.content || 'No analysis generated.';
 
-    // ── Natively Append Sources to Bottom ────────────────────────────────────
-    if (news && news.length > 0) {
+    if (news && news.length > 0 && symbol) {
       let sourcesHtml = '\n\n';
       news.slice(0, 5).forEach((n) => {
         let domain = 'News';
@@ -488,7 +547,6 @@ RULES:
       analysis += sourcesHtml;
     }
 
-    // ── 8. Save messages to session ──────────────────────────────────────────
     session.messages.push({ role: 'user', content: question, symbol: symbol || null });
     session.messages.push({ role: 'assistant', content: analysis, symbol: symbol || null, marketData: marketData || null });
     if (session.messages.length > 100) session.messages = session.messages.slice(-100);
