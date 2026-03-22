@@ -3,6 +3,7 @@ import cors from 'cors';
 import dotenv from 'dotenv';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import rateLimit from 'express-rate-limit';
 import { connectDB } from './db/connection.js';
 
 // IMPORTANT: Load environment variables FIRST before anything else
@@ -13,6 +14,7 @@ import authRoutes from './routes/auth.js';
 import botsRoutes from './routes/bots.js';
 import adminRoutes from './routes/admin.js';
 import marketsRoutes from './routes/markets.js';
+import { initCronJobs } from './services/cron.js';
 
 const app = express();
 const PORT = process.env.PORT || 5000;
@@ -26,7 +28,10 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 // Connect to MongoDB
-connectDB().catch((error) => {
+connectDB().then(() => {
+  // Launch daemon background workers once DB is successfully mounted
+  initCronJobs();
+}).catch((error) => {
   console.error('Failed to connect to MongoDB:', error.message);
   process.exit(1);
 });
@@ -48,8 +53,17 @@ app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 
+// Rate limiter for auth routes
+const authLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 20,
+  message: { success: false, error: 'Too many requests, please try again later.' },
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
 // Routes
-app.use('/api/auth', authRoutes);
+app.use('/api/auth', authLimiter, authRoutes);
 app.use('/api/bots', botsRoutes);
 app.use('/api/admin', adminRoutes);
 app.use('/api/markets', marketsRoutes);
@@ -57,16 +71,6 @@ app.use('/api/markets', marketsRoutes);
 // Health check
 app.get('/api/health', (req, res) => {
   res.json({ message: 'Server is running', timestamp: new Date() });
-});
-
-// Debug endpoint to show JWT_SECRET (DELETE IN PRODUCTION!)
-app.get('/api/debug/jwt-secret', (req, res) => {
-  const secret = process.env.JWT_SECRET || 'your-secret-key';
-  res.json({ 
-    jwt_secret: secret,
-    jwt_secret_preview: secret.substring(0, 20) + '...',
-    env_loaded: !!process.env.JWT_SECRET
-  });
 });
 
 // 404 handler

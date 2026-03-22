@@ -1,0 +1,21 @@
+{
+  "version": 2,
+  "buildCommand": "npm run build",
+  "devCommand": "npm run dev",
+  "installCommand": "npm install",
+  "env": {
+    "PORT": "5000",
+    "NODE_ENV": "production",
+    "JWT_SECRET": "@phonix-jwt-secret",
+    "MONGODB_URI": "@mongodb-uri",
+    "FRONTEND_URL": "https://phonix-two.vercel.app",
+    "OPENROUTER_API_KEY": "@openrouter-key",
+    "ALPHA_VANTAGE_KEY": "@alpha-vantage-key"
+  },
+  "functions": {
+    "server.js": {
+      "maxDuration": 60,
+      "memory": 1024
+    }
+  }
+}

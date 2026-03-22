@@ -23,11 +23,6 @@ const marketDataSchema = new mongoose.Schema({
     type: Date,
     default: Date.now,
     index: true
-  },
-  expiresAt: {
-    type: Date,
-    default: () => new Date(+new Date() + 24*60*60*1000), // 24 hours
-    index: { expires: 0 } // TTL index
   }
 });
 

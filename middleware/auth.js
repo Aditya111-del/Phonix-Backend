@@ -21,7 +21,12 @@ export const authenticate = (req, res, next) => {
 
     const decoded = jwt.verify(token, secret);
     console.log('[Auth] Token verified, user:', decoded.email, 'role:', decoded.role);
-    req.user = decoded;
+    
+    // Map id to _id for MongoDB compatibility
+    req.user = {
+      ...decoded,
+      _id: decoded.id || decoded._id
+    };
     next();
   } catch (error) {
     console.error('[Auth] Token verification failed:', error.message);

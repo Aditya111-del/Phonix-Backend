@@ -2,6 +2,8 @@ import express from 'express';
 import { authenticate } from '../middleware/auth.js';
 import { MarketData } from '../models/schemas/MarketData.js';
 import { News } from '../models/schemas/News.js';
+import ChatSession from '../models/schemas/ChatSession.js';
+import { fetchAngelQuote } from '../services/angelOne.js';
 
 const router = express.Router();
 
@@ -159,86 +161,356 @@ router.get('/quote/:symbol', authenticate, async (req, res) => {
   }
 });
 
+// ── Session Management Routes ─────────────────────────────────────────────
+
 /**
- * Analyze stock with AI (OpenRouter - Step-3.5-Flash with reasoning)
- * POST /api/markets/analyze
+ * List all sessions for the current user
+ * GET /api/markets/sessions
  */
+router.get('/sessions', authenticate, async (req, res) => {
+  try {
+    const sessions = await ChatSession.find({ userId: req.user.id })
+      .sort({ updatedAt: -1 })
+      .select('_id title lastSymbol createdAt updatedAt messages')
+      .lean();
+    
+    const formatted = sessions.map(s => ({
+      id: s._id,
+      title: s.title,
+      symbol: s.lastSymbol,
+      preview: s.messages?.[s.messages.length - 1]?.content?.substring(0, 100) || '',
+      messageCount: s.messages?.length || 0,
+      createdAt: s.createdAt,
+      updatedAt: s.updatedAt,
+    }));
+
+    res.json({ success: true, sessions: formatted });
+  } catch (err) {
+    console.error('[Sessions] List error:', err.message);
+    res.status(500).json({ success: false, error: 'Failed to load sessions' });
+  }
+});
+
+/**
+ * Get a single session with full messages
+ * GET /api/markets/sessions/:id
+ */
+router.get('/sessions/:id', authenticate, async (req, res) => {
+  try {
+    const session = await ChatSession.findOne({
+      _id: req.params.id,
+      userId: req.user.id,
+    });
+
+    if (!session) return res.status(404).json({ success: false, error: 'Session not found' });
+
+    res.json({ success: true, session });
+  } catch (err) {
+    console.error('[Sessions] Get error:', err.message);
+    res.status(500).json({ success: false, error: 'Failed to load session' });
+  }
+});
+
+/**
+ * Delete a session
+ * DELETE /api/markets/sessions/:id
+ */
+router.delete('/sessions/:id', authenticate, async (req, res) => {
+  try {
+    await ChatSession.deleteOne({ _id: req.params.id, userId: req.user.id });
+    res.json({ success: true });
+  } catch (err) {
+    console.error('[Sessions] Delete error:', err.message);
+    res.status(500).json({ success: false, error: 'Failed to delete session' });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+
+
 router.post('/analyze', authenticate, async (req, res) => {
   try {
-    const { symbol, question, marketData, news } = req.body;
+    let { symbol, question, marketData, news, sessionId } = req.body;
     
-    if (!symbol || !question) {
-      return res.status(400).json({ 
-        error: 'Symbol and question are required' 
-      });
+    if (!question) return res.status(400).json({ error: 'Question is required' });
+
+    console.log('[Markets/Analyze] User:', req.user.id, '| Q:', question, '| Session:', sessionId || 'new');
+
+    // ── 1. Auto-detect symbol ────────────────────────────────────────────────
+    const nameTickers = {
+      // US Stocks
+      apple: 'AAPL', microsoft: 'MSFT', google: 'GOOGL', alphabet: 'GOOGL',
+      amazon: 'AMZN', meta: 'META', facebook: 'META', tesla: 'TSLA',
+      nvidia: 'NVDA', netflix: 'NFLX', salesforce: 'CRM', shopify: 'SHOP',
+      sp500: 'SPY', 'sp 500': 'SPY', nasdaq: 'QQQ', dow: 'DIA',
+      
+      // Crypto
+      bitcoin: 'BTC', ethereum: 'ETH', solana: 'SOL', ripple: 'XRP',
+      dogecoin: 'DOGE', cardano: 'ADA', binance: 'BNB',
+      
+      // Forex / Commodities
+      gold: 'GLD', oil: 'USO', silver: 'SLV',
+      'eur/usd': 'EURUSD', 'gbp/usd': 'GBPUSD', 'usd/inr': 'USDINR', 'usd/jpy': 'USDJPY',
+      
+      // Indian Stocks (NSE/BSE)
+      reliance: 'RELIANCE.BSE', tcs: 'TCS.BSE', hdfc: 'HDFCBANK.BSE',
+      infosys: 'INFY.BSE', icici: 'ICICIBANK.BSE', sbi: 'SBIN.BSE',
+      'bharti airtel': 'BHARTIARTL.BSE', itc: 'ITC.BSE',
+      nifty: '^NSEI', sensex: '^BSESN',
+      
+      // Generic Benchmarks mapped explicitly to live quotes!
+      'indian market': '^NSEI', indian: '^NSEI', india: '^NSEI',
+      'us market': 'SPY', usa: 'SPY'
+    };
+    if (!symbol) {
+      const lowerQ = question.toLowerCase();
+      for (const [name, ticker] of Object.entries(nameTickers)) {
+        if (lowerQ.includes(name) && ticker) { symbol = ticker; break; }
+      }
+      if (!symbol) {
+        const tm = question.match(/\b([A-Z]{2,6}(\.[A-Z]{2,4})?)\b/);
+        if (tm) symbol = tm[1];
+      }
     }
 
-    console.log('[Markets/Analyze] Processing:', symbol, 'Question:', question);
+    // ── 2. Load or create session ────────────────────────────────────────────
+    let session;
+    if (sessionId) {
+      session = await ChatSession.findOne({ _id: sessionId, userId: req.user.id });
+    }
+    if (!session) {
+      session = new ChatSession({
+        userId: req.user.id,
+        title: question.substring(0, 60),
+        lastSymbol: symbol || null,
+      });
+    }
+    if (symbol) session.lastSymbol = symbol;
 
-    // Build market context
-    const context = buildMarketContext(symbol, marketData, news);
+    // ── 3. Auto-fetch real-time market data & news ───────────────────────────
+    if (!marketData || !marketData.price || !news || news.length === 0) {
+      console.log('[Markets/Analyze] Fetching live context for:', symbol || 'general query');
+      try {
+        let qPromise = Promise.resolve(null);
+        
+        if (symbol) {
+          const isIndianAsset = symbol.includes('.BSE') || symbol.includes('^NSEI') || symbol.includes('^BSESN');
+          if (isIndianAsset) {
+            qPromise = fetchAngelQuote(symbol).then(data => data || fetchQuote(symbol)); // Try Angel, fallback AV
+          } else {
+            qPromise = fetchQuote(symbol);
+          }
+        }
+        
+        const searchTarget = symbol ? symbol + " stock" : question.substring(0, 100);
+        const [q, n, h] = await Promise.allSettled([
+          qPromise, 
+          fetchNews(searchTarget),
+          symbol ? MarketData.find({ symbol }).sort({ timestamp: -1 }).limit(100).lean() : Promise.resolve([])
+        ]);
+        
+        if (q.status === 'fulfilled' && q.value) marketData = q.value;
+        if (n.status === 'fulfilled' && n.value.length > 0) news = n.value;
+        if (h.status === 'fulfilled' && h.value && h.value.length > 0) req.marketHistory = h.value;
+      } catch (e) {
+        console.log('[Markets/Analyze] Data fetch failed:', e.message);
+      }
+    }
 
-    // Call OpenRouter API with reasoning
-    const systemPrompt = `You are an expert financial analyst with deep knowledge of markets, stocks, and trading.
-You analyze market data, news, and technical indicators to provide insights about stocks.
-Always be data-driven and cite specific numbers from the provided data.
-Do NOT make definitive buy/sell recommendations - instead provide analysis and observations.
-Be concise and focus on answering the user's specific question.
-Acknowledge uncertainty when appropriate.
-Format your response with clear sections and bullet points where helpful.`;
+    // ── 4. Build market context ───────────────────────────────────────────────
+    let context = '';
+    if (symbol && marketData?.price) {
+      const dir = marketData.change >= 0 ? '▲' : '▼';
+      const pct = Math.abs(marketData.changePercent || 0).toFixed(2);
+      const isINR = marketData.source === 'Angel One SmartAPI' || symbol.includes('.BSE') || symbol.includes('^NSEI');
+      const cur = isINR ? '₹' : '$';
+      context = `
+=== LIVE DATA: ${symbol} ===
+Price: ${cur}${marketData.price?.toFixed(2)}  |  Change: ${dir}${cur}${Math.abs(marketData.change||0).toFixed(2)} (${dir}${pct}%)
+Open: ${cur}${marketData.open?.toFixed(2)}  |  High: ${cur}${marketData.high?.toFixed(2)}  |  Low: ${cur}${marketData.low?.toFixed(2)}
+Volume: ${marketData.volume ? (marketData.volume/1e6).toFixed(2)+'M' : 'N/A'}`;
+      if (marketData.fundamentals) {
+        const f = marketData.fundamentals;
+        context += `
+Sector: ${f.sector||'N/A'} | P/E: ${f.pe||'N/A'} | EPS: ${cur}${f.eps||'N/A'} | Mkt Cap: ${f.marketCap?cur+(parseInt(f.marketCap)/1e9).toFixed(1)+'B':'N/A'}`;
+      }
+    }
+    if (req.marketHistory && req.marketHistory.length > 0) {
+      const history = req.marketHistory;
+      
+      // Calculate 5-Day Weekly Technicals
+      const weekHistory = history.slice(0, 5);
+      const wHigh = Math.max(...weekHistory.map(d => d.high || d.price));
+      const wLow = Math.min(...weekHistory.map(d => d.low || d.price));
+      const wOpen = weekHistory[weekHistory.length - 1]?.open || weekHistory[weekHistory.length - 1]?.price;
 
-    const fullPrompt = `Market Data Context:
-${context}
+      const getPrice = (days) => {
+        const doc = history.find(d => (new Date() - new Date(d.timestamp)) >= days*24*60*60*1000);
+        return doc ? doc.price : null;
+      };
+      const p30 = getPrice(30);
+      const p60 = getPrice(60);
+      const p90 = getPrice(90);
 
-User Question: ${question}
+      const isIndianAsset = symbol && (symbol.includes('.BSE') || symbol.includes('^NSEI') || symbol.includes('^BSESN'));
+      const formatCur = isIndianAsset ? '₹' : '$';
 
-Please provide a detailed analysis based on the data above.`;
+      if (weekHistory.length > 1) {
+        context += `\n\n=== VERIFIED TECHNICAL METRICS (${symbol}) ===`;
+        if (marketData?.price) context += `\n- Current Close: ${formatCur}${marketData.price.toFixed(2)}`;
+        if (wOpen) context += `\n- Last 5-Day Open: ${formatCur}${wOpen.toFixed(2)}`;
+        if (wHigh) context += `\n- Last 5-Day High: ${formatCur}${wHigh.toFixed(2)}`;
+        if (wLow) context += `\n- Last 5-Day Low: ${formatCur}${wLow.toFixed(2)}`;
+        
+        context += `\n\n- RECENT DAILY DATA (Last 10 Trading Days):`;
+        history.slice(0, 10).forEach(day => {
+          const dateStr = new Date(day.timestamp).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
+          const clse = day.price ? day.price.toFixed(2) : 'N/A';
+          const opn = day.open ? day.open.toFixed(2) : 'N/A';
+          const hi = day.high ? day.high.toFixed(2) : 'N/A';
+          const lo = day.low ? day.low.toFixed(2) : 'N/A';
+          context += `\n  * ${dateStr} - Close: ${formatCur}${clse} | Open: ${formatCur}${opn} | High: ${formatCur}${hi} | Low: ${formatCur}${lo}`;
+        });
 
-    const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+        if (p30) context += `\n\n- 1 Month Ago: ${formatCur}${p30.toFixed(2)}`;
+        if (p60) context += `\n- 2 Months Ago: ${formatCur}${p60.toFixed(2)}`;
+        if (p90) context += `\n- 3 Months Ago: ${formatCur}${p90.toFixed(2)}`;
+      }
+    }
+
+    if (news?.length > 0) {
+      context += `\n\n=== LIVE NEWS ===`;
+      news.slice(0, 5).forEach((n, i) => {
+        const h = n.headline || n.title || '';
+        const s = n.sentiment ? ` [${n.sentiment}]` : '';
+        let domain = 'News';
+        try { if (n.url) domain = new URL(n.url).hostname.replace('www.', ''); } catch(e){}
+        context += `\n${i+1}. ${h}${s} (Source: [${domain}](${n.url || ''}))`;
+      });
+    }
+    if (!context) context = 'If no live market data was fetched, you MUST still provide your best analysis, price targets, and signals based on your extensive financial knowledge up to your cutoff date, adapting it to the current market environment.';
+
+    // ── 5. Build conversation history for multi-turn context ─────────────────
+    const historyMessages = session.messages.slice(-10).map(m => ({
+      role: m.role,
+      content: m.content,
+    }));
+
+    // ── 6. System prompt — human-readable PhonixAI ───────────────────────────
+    const currentDate = new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata', dateStyle: 'full', timeStyle: 'short' });
+    const isIndianAsset = symbol && (symbol.includes('.BSE') || symbol.includes('^NSEI') || symbol.includes('^BSESN'));
+    
+    const systemPrompt = `You are PhonixAI, an expert financial analyst and market strategist. 
+
+CRITICAL INFORMATION:
+- The current date and time is: ${currentDate} (IST - Indian Standard Time).
+- NEVER say you don't know the current date. You are operating in real-time.
+- If the current time is outside Indian Market Hours (Mon-Fri, 9:15 AM to 3:30 PM IST), the "Current Close" is the PREVIOUS SESSION'S CLOSING PRICE. Do NOT hallucinate that a move is happening "today intraday" if it's the weekend or 1:00 AM on a Monday. 
+- You analyze US Stocks, Indian Stocks (NSE/BSE), Crypto markets, and Forex pairs comprehensively.
+
+Your job is to give crisp, human-readable trading analysis. Use plain English — no LaTeX, no raw math formulas.
+
+For every stock/crypto/forex question, structure your response exactly like this:
+
+## Signal & Confidence
+Start with one of: 🟢 STRONG BUY / 🟡 BUY / ⚪ HOLD / 🔴 SELL / ⛔ STRONG SELL — then state your confidence (e.g. 82% confident).
+
+## Price Targets — 30-Day Outlook
+Use a simple Markdown table:
+| Scenario | Target | Move |
+|----------|--------|------|
+| 🎯 Bull | $XXX | +X% |
+| 📍 Base | $XXX | +X% |
+| ⚠️ Stop-Loss | $XXX | -X% |
+Then state the risk-reward ratio in plain English (e.g. "Risk-reward is 2:1 — you risk $15 to make $30"). (Adjust currency to ₹ INR for Indian stocks, or standard base currencies for Forex).
+
+## Key Levels
+Provide the exact Support and Resistance levels as bullet points (NOT a table), including the reason:
+- **Support:** ${isIndianAsset ? '₹' : '$'}XXX (Reason: ...)
+- **Resistance:** ${isIndianAsset ? '₹' : '$'}YYY (Reason: ...)
+
+## News & Sentiment
+Briefly summarize current market sentiment: Bullish / Neutral / Bearish and why in 1-2 sentences.
+
+## Trader's Thesis
+One clear paragraph: why this trade makes sense right now, what catalysts to watch, and what would invalidate this call. Provide real predictions and detailed technical/fundamental reasons.
+
+RULES:
+- Be direct and decisive. Never hedge excessively.
+- CRITICAL: DO NOT HALLUCINATE NUMBERS. If macro data (like FII/DII flows, specific auto sales, exact percentages) is NOT explicitly mentioned in the Live News context, DO NOT invent it. Instead, rely on broader logical inferences.
+- DO NOT add inline source citations. The backend will automatically append a list of sources to the bottom of your response.
+- Follow the EXACT Verified Technical Metrics provided to you when referencing past highs/lows. Do not guess the history.
+- Use the live market data provided if available. If none is provided, still give concrete price targets and a signal based on historical ranges and your internal data models up to ${currentDate}.
+- If user is asking a follow-up question, use the conversation history for context.
+- Keep your response scannable — use headers and bullets. ONLY use a table for the 30-Day Outlook.
+- Never output LaTeX or raw math. Write numbers in plain English.`;
+
+    // ── 7. Call AI ────────────────────────────────────────────────────────────
+    const aiMessages = [
+      { role: 'system', content: systemPrompt + (context ? `\n\nCurrent Market Context:\n${context}` : '') },
+      ...historyMessages,
+      { role: 'user', content: question },
+    ];
+
+    const llmResponse = await fetch('https://openrouter.ai/api/v1/chat/completions', {
       method: 'POST',
       headers: {
         'Authorization': `Bearer ${OPENROUTER_API_KEY}`,
-        'Content-Type': 'application/json'
+        'Content-Type': 'application/json',
+        'HTTP-Referer': 'https://phonix.app',
+        'X-Title': 'PhonixAI Trading Assistant',
       },
       body: JSON.stringify({
-        model: 'stepfun/step-3.5-flash:free',
-        messages: [
-          {
-            role: 'system',
-            content: systemPrompt
-          },
-          {
-            role: 'user',
-            content: fullPrompt
-          }
-        ],
-        reasoning: { enabled: true },
-        temperature: 0.7,
-        max_tokens: 1024
-      })
+        model: 'nvidia/nemotron-3-super-120b-a12b:free',
+        messages: aiMessages,
+        temperature: 0.65,
+        max_tokens: 1500,
+      }),
     });
 
-    if (!response.ok) {
-      throw new Error(`OpenRouter API error: ${response.status}`);
+    if (!llmResponse.ok) {
+      const errText = await llmResponse.text();
+      console.error('[Markets/Analyze] LLM error:', llmResponse.status, errText);
+      throw new Error(`AI service error: ${llmResponse.status}`);
     }
 
-    const data = await response.json();
-    const analysis = data.choices[0]?.message?.content || '';
+    const llmData = await llmResponse.json();
+    let analysis = llmData.choices?.[0]?.message?.content || 'No analysis generated.';
+
+    // ── Natively Append Sources to Bottom ────────────────────────────────────
+    if (news && news.length > 0) {
+      let sourcesHtml = '\n\n';
+      news.slice(0, 5).forEach((n) => {
+        let domain = 'News';
+        try { if (n.url) domain = new URL(n.url).hostname.replace('www.', ''); } catch(e){}
+        if (n.url) sourcesHtml += `[${domain}](${n.url}) `;
+      });
+      analysis += sourcesHtml;
+    }
+
+    // ── 8. Save messages to session ──────────────────────────────────────────
+    session.messages.push({ role: 'user', content: question, symbol: symbol || null });
+    session.messages.push({ role: 'assistant', content: analysis, symbol: symbol || null, marketData: marketData || null });
+    if (session.messages.length > 100) session.messages = session.messages.slice(-100);
+    await session.save();
+
+    console.log('[Markets/Analyze] Done. Session:', session._id, '| Symbol:', symbol || 'general');
 
     res.json({
       success: true,
       analysis,
-      symbol,
-      question
+      symbol: symbol || null,
+      sessionId: session._id,
+      marketData: marketData || null,
     });
 
   } catch (error) {
     console.error('[Markets/Analyze] Error:', error.message);
-    res.status(500).json({ 
-      error: error.message || 'Failed to analyze stock' 
-    });
+    res.status(500).json({ success: false, error: error.message || 'Analysis failed. Please try again.' });
   }
 });
+
+
 
 /**
  * COMPREHENSIVE MARKET INTELLIGENCE ENDPOINT
@@ -737,9 +1009,48 @@ async function fetchOverview(symbol) {
 /**
  * Helper: Fetch news and sentiment
  */
-async function fetchNews(symbol) {
+async function fetchNews(query) {
   try {
-    const url = `https://www.alphavantage.co/query?function=NEWS_SENTIMENT&tickers=${symbol}&limit=10&apikey=${AV_API_KEY}`;
+    // Try Tavily AI Search first for much more accurate global/Indian market news
+    if (process.env.TAVILY_API_KEY) {
+      const tavilyUrl = 'https://api.tavily.com/search';
+      const searchResponse = await fetch(tavilyUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          api_key: process.env.TAVILY_API_KEY,
+          query: `${query} financial market news latest updates analysis`,
+          search_depth: 'basic',
+          include_images: false,
+          include_answer: false,
+          topic: 'news',
+          days: 3,
+          max_results: 5
+        })
+      });
+      const tavilyData = await searchResponse.json();
+      
+      if (tavilyData && tavilyData.results && tavilyData.results.length > 0) {
+        return tavilyData.results.map((item, idx) => {
+          let hostname = 'news';
+          try { hostname = new URL(item.url).hostname.replace('www.', ''); } catch(e){}
+          return {
+            id: 'news_' + idx + '_' + Math.random().toString(36).substr(2, 5),
+            title: item.title,
+            summary: item.content,  // Tavily returns highly summarized snippet 'content'
+            source: hostname,
+            sentiment: 'NEUTRAL', // Tavily gives deep snippets, the LLM will determine sentiment
+            sentimentScore: 0,
+            relevance: item.score || 0.9,
+            url: item.url,
+            timePublished: item.published_date || new Date().toISOString()
+          };
+        });
+      }
+    }
+
+    // Fallback to Alpha Vantage if Tavily fails or doesn't have data (only works well for strict symbols)
+    const url = `https://www.alphavantage.co/query?function=NEWS_SENTIMENT&tickers=${query.split(' ')[0]}&limit=5&apikey=${AV_API_KEY}`;
     const response = await fetch(url);
     const data = await response.json();
     
@@ -748,7 +1059,7 @@ async function fetchNews(symbol) {
     }
 
     return data['feed'].map((item, idx) => ({
-      id: symbol + '_news_' + idx,
+      id: 'av_news_' + idx,
       title: item['title'],
       summary: item['summary'],
       source: item['source'],
